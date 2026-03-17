@@ -1,117 +1,87 @@
-from bedrock_agentcore.tools.code_interpreter_client import CodeInterpreter
-from bedrock_agentcore import BedrockAgentCoreApp
-from strands.models import BedrockModel
-import pandas as pd
-from strands import Agent, tool
+import os
+import json
 import asyncio
 from typing import Dict, Any
-import json
-import os
+from bedrock_agentcore.runtime import BedrockAgentCoreApp
+from bedrock_agentcore.tools.code_interpreter_client import CodeInterpreter
+from strands.models import BedrockModel
+from strands import Agent, tool
 
 app = BedrockAgentCoreApp()
 
+# Global Setup
 region = os.getenv("AWS_REGION", "us-east-1")
 code_client = CodeInterpreter(region)
 code_client.start(session_timeout_seconds=1200)
 
-def call_tool(tool_name: str, arguments: Dict[str, Any]) -> str:
-    """Helper to invoke sandbox tools with session persistence"""
-    # Note: AgentCore invoke returns a stream. We need the full result.
-    response = code_client.invoke(tool_name, arguments)
-    
-    for event in response["stream"]:
-        return json.dumps(event["result"])
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 def read_file(file_path: str) -> str:
-    """Helper function to read file content with error handling"""
     try:
         with open(file_path, 'r', encoding='utf-8') as file:
             return file.read()
-    except FileNotFoundError:
-        print(f"Error: The file '{file_path}' was not found.")
-        return ""
     except Exception as e:
-        print(f"An error occurred: {e}")
+        print(f"Error reading {file_path}: {e}")
         return ""
 
 
-#Define and configure the code interpreter tool
 @tool
 def execute_python(code: str, session_id: str, description: str = "") -> str:
     """Execute Python code in the secure sandbox."""
     if description:
         code = f"# {description}\n{code}"
 
-    print(f"\n--- Executing Code ---\n{code}\n----------------------")
-
+    print(f"\n--- Executing Code (sandbox session: {code_client.session_id}) ---\n{code}\n---")
+    
     response = code_client.invoke("executeCode", {
-            "code": code,
-            "language": "python",
-            "clearContext": False
-        }
-    )
+        "code": code,
+        "language": "python",
+        "clearContext": False
+    })
     
     output = ""
+    error = ""
     for event in response.get("stream", []):
-        if "result" in event:
-            output += event["result"].get("stdout", "")
-    return output
+        structured = event.get("result", {}).get("structuredContent", {})
+        output += structured.get("stdout", "")
+        error += structured.get("stderr", "")
 
-# Load system prompt
-SYSTEM_PROMPT = read_file("assets/system_prompt.txt")
+    if error: return f"Errors: {error}"
+    return output if output else "Executed successfully (no stdout)."
 
-model_id="deepseek.v3.2"
-model= BedrockModel(model_id=model_id)
+# Initialize Model & Agent
+SYSTEM_PROMPT = read_file(os.path.join(PROJECT_ROOT, "assets", "system_prompt.txt"))
+model = BedrockModel(model_id="deepseek.v3.2")
+agent = Agent(model=model, tools=[execute_python], system_prompt=SYSTEM_PROMPT)
 
-# Instantiate the Strands Agent
-agent=Agent(
-    model=model,
-        tools=[execute_python],
-        system_prompt=SYSTEM_PROMPT,
-        callback_handler=None)
-
-
+# Helper for data syncing
 def write_data_file_in_sandbox():
-    data_file_content = read_file("data/train.csv")
-    files_to_create = [
-                    {
-                        "path": "train.csv",
-                        "text": data_file_content
-                }]
-
-    # Write files to sandbox
-    writing_files = call_tool("writeFiles", {"content": files_to_create})
-    print("Writing files result:")
-    print(writing_files)
-
-    # Verify files were created
-    listing_files = call_tool("listFiles", {"path": ""})
-    print("\nFiles in sandbox:")
-    print(listing_files)
+    data_path = os.path.join(PROJECT_ROOT, "data", "train_small.csv")
+    data_content = read_file(data_path)
+    if not data_content:
+        raise FileNotFoundError(f"Data file not found or empty: {data_path}")
+    args = {"content": [{"path": "train_small.csv", "text": data_content}]}
+    code_client.invoke("writeFiles", args)
+    print(f"Data synced to sandbox (session: {code_client.session_id})")
 
 @app.entrypoint
 async def invoke(payload: Dict[str, Any]):
     """The main entry point called by AWS AgentCore"""
     
+    # Sync data to sandbox
     write_data_file_in_sandbox()
     
-    # Extract prompt and session info from payload
-    query = "Load the file 'train.csv' and perform exploratory data analysis(EDA) on it. Tell me about distributions and outlier values."
+    query = payload.get("prompt", "")
     
-    # Execute Agent Logic
-    response_text = ""
     try:
-        # Strands stream_async returns chunks of the response
-        async for event in agent.stream_async(query):
-            if "data" in event:
-                chunk = event["data"]
-                response_text += chunk
-                print(chunk, end="", flush=True)
+        response = await agent.invoke_async(query)
+        return {"result": response.message['content'][0]['text']}
     except Exception as e:
-        response_text = f"Error: {str(e)}"
-
-    return {"result": response_text}
+        print(f"Error during agent execution: {e}")
+        return {"result": f"Execution Error: {str(e)}"}
 
 if __name__ == "__main__":
-    # app.run() starts the HTTP server on port 8080
-    app.run()
+    try:
+        app.run()
+    finally:
+        code_client.stop()

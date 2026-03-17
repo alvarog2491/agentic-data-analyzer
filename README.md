@@ -27,9 +27,27 @@ It leverages **Amazon Bedrock AgentCore** alongside the built-in **Code Interpre
 4. **Add your data:**
    Place the datasets you wish to analyze into the `data/` directory.
 
-5. **Run the local agent development server:**
+5. **Test it locally**
+   Open a terminal window and start your agent with the following command:
+   ```
+   python3 src/data_analyzer_agent.py
+   ```
+   Test your agent by opening another terminal window and enter the following command:
+   ```
+   curl -X POST http://localhost:8080/invocations \
+        -H "Content-Type: application/json" \
+        -d '{"prompt": "Hello!"}'
+   ```
+
+6. **Create configuration file and deploy the agent to AWS Bedrock AgentCore:**
    ```bash
-   agentcore dev
+      agentcore configure --entrypoint my_agent.py
+      agentcore deploy
+   ```
+
+7. **Destroy the agent**
+   ```bash
+      agentcore destroy
    ```
 
 ## License
